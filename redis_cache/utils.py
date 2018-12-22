@@ -1,13 +1,18 @@
 import importlib
 import warnings
+from itertools import chain
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils import six
 from django.utils.encoding import force_text, python_2_unicode_compatible
 from django.utils.six.moves.urllib.parse import parse_qs, urlparse
 
+from redis import ConnectionError
 from redis._compat import unicode
 from redis.connection import SSLConnection
+
+from redis_cache.connection import get_connection_identifier_from_client
+from redis_cache.connection import pool
 
 
 def get_servers(location):
@@ -156,3 +161,65 @@ def parse_connection_kwargs(server, db=None, **kwargs):
         )
 
     return kwargs
+
+
+class MethodProxy(object):
+    max_call_count = 3
+
+    def __init__(self, client_proxy, client, method_attr):
+        self.client_proxy = client_proxy
+        self.client = client
+        self.method_attr = method_attr
+
+    def _call(self, call_count, *args, **kwargs):
+        try:
+            return getattr(self.client, self.method_attr)(*args, **kwargs)
+        except ConnectionError as exc:
+            if call_count == self.max_call_count:
+                raise exc
+
+            # Delete connection within our pool.
+            connection_identifier = get_connection_identifier_from_client(self.client)
+            try:
+                del pool._connection_pools[connection_identifier]
+            except KeyError:
+                pass
+
+            # Recreate the connection
+            self.client = self.client_proxy.client = self.client_proxy.create_client()
+            self._call(call_count + 1, *args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        return self._call(1, *args, **kwargs)
+
+
+class ClientProxy(object):
+    client_class = None
+    connection_kwargs = None
+    connection_pool_kwargs = None
+    client = None
+    _method_cache = None
+
+    def __init__(self, client_class, connection_kwargs, connection_pool_kwargs):
+        self.client_class = client_class
+        self.connection_kwargs = connection_kwargs
+        self.connection_pool_kwargs = connection_pool_kwargs
+        self.client = self.create_client()
+        self._method_cache = {}
+
+    def create_client(self):
+        client = self.client_class(**self.connection_kwargs)
+        complete_kwargs = dict(
+            chain(self.connection_kwargs.items(), self.connection_pool_kwargs.items())
+        )
+        connection_pool = pool.get_connection_pool(client, **complete_kwargs)
+        client.connection_pool = connection_pool
+        return client
+
+    def __getattr__(self, attr):
+        if callable(getattr(self.client, attr)):
+            if attr not in self.__dict__['_method_cache']:
+                self._method_cache[attr] = MethodProxy(self, self.client, attr)
+            return self._method_cache[attr]
+        else:
+            return getattr(self.client, attr)

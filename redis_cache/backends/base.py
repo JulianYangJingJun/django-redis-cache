@@ -14,8 +14,7 @@ except ImportError:
 
 from redis.connection import DefaultParser
 from redis_cache.constants import KEY_EXPIRED, KEY_NON_VOLATILE
-from redis_cache.connection import pool
-from redis_cache.utils import get_servers, parse_connection_kwargs, import_class
+from redis_cache.utils import get_servers, parse_connection_kwargs, import_class, ClientProxy
 
 
 def get_client(write=False):
@@ -176,22 +175,25 @@ class BaseRedisCache(BaseCache):
         )]
 
     def create_client(self, server):
-        kwargs = parse_connection_kwargs(
+        connection_kwargs = parse_connection_kwargs(
             server,
             db=self.db,
             password=self.password,
             socket_timeout=self.socket_timeout,
             socket_connect_timeout=self.socket_connect_timeout,
         )
-        client = self.Redis(**kwargs)
-        kwargs.update(
+        connection_pool_kwargs = dict(
             parser_class=self.parser_class,
             connection_pool_class=self.connection_pool_class,
             connection_pool_class_kwargs=self.connection_pool_class_kwargs,
         )
-        connection_pool = pool.get_connection_pool(client, **kwargs)
-        client.connection_pool = connection_pool
-        return client
+        client_proxy = ClientProxy(
+            self.Redis,
+            connection_kwargs=connection_kwargs.copy(),
+            connection_pool_kwargs=connection_pool_kwargs.copy(),
+        )
+
+        return client_proxy
 
     def serialize(self, value):
         return self.serializer.serialize(value)

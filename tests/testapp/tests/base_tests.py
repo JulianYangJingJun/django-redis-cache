@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
+from contextlib import contextmanager
 from hashlib import sha1
 import os
 import subprocess
@@ -13,17 +14,18 @@ try:
 except ImportError:
     import pickle
 
+import mock
+import redis
+
 from django.core.cache import caches
 from django.core.exceptions import ImproperlyConfigured
 from django.test import TestCase, override_settings
 from django.utils.encoding import force_bytes
 
-import redis
-
 from tests.testapp.models import Poll, expensive_calculation
 from redis_cache.cache import RedisCache, pool
-from redis_cache.constants import KEY_EXPIRED, KEY_NON_VOLATILE
-from redis_cache.utils import get_servers, parse_connection_kwargs
+from redis_cache.constants import KEY_EXPIRED
+from redis_cache.utils import get_servers, parse_connection_kwargs, MethodProxy
 
 
 REDIS_PASSWORD = 'yadayada'
@@ -40,6 +42,27 @@ def f():
 class C:
     def m(n):
         return 24
+
+
+def noop(*args, **kwargs):
+    pass
+
+
+@contextmanager
+def set_release_to_noop(cache, max_connections=2):
+    releases = {}
+    original_max_connections = {}
+    for client in cache.clients.values():
+        releases[client.connection_pool] = client.connection_pool.release
+        client.connection_pool.release = noop
+        original_max_connections[client] = client.connection_pool.max_connections
+        client.connection_pool.max_connections = max_connections
+
+    yield
+
+    for client in cache.clients.values():
+        client.connection_pool.release = releases[client.connection_pool]
+        client.connection_pool.max_connections = original_max_connections[client]
 
 
 def start_redis_servers(servers, db=None, master=None):
@@ -579,29 +602,45 @@ class BaseRedisTestCase(SetupMixin):
         pool._connection_pools = {}
         cache = caches['default']
 
-        def noop(*args, **kwargs):
-            pass
+        with set_release_to_noop(cache):
+            with mock.patch.object(MethodProxy, 'max_call_count', new=1):
+                cache.set('a', 'a')
+                self.assertMaxConnection(cache, 1)
+                cache.set('a', 'a')
+                self.assertMaxConnection(cache, 2)
 
-        releases = {}
-        for client in cache.clients.values():
-            releases[client.connection_pool] = client.connection_pool.release
-            client.connection_pool.release = noop
-            self.assertEqual(client.connection_pool.max_connections, 2)
+                with self.assertRaises(redis.ConnectionError):
+                    cache.set('a', 'a')
 
-        cache.set('a', 'a')
-        self.assertMaxConnection(cache, 1)
+                self.assertMaxConnection(cache, 2)
 
-        cache.set('a', 'a')
-        self.assertMaxConnection(cache, 2)
+    def test_retry_connections(self):
+        pool._connection_pools = {}
+        cache = caches['default']
 
-        with self.assertRaises(redis.ConnectionError):
+        with mock.patch.object(MethodProxy, 'max_call_count', new=2):
+            with set_release_to_noop(cache):
+                cache.set('a', 'a')
+                first_ids = {id(client.connection_pool) for client in cache.clients.values()}
+                self.assertMaxConnection(cache, 1)
+                cache.set('a', 'a')
+                self.assertMaxConnection(cache, 2)
+                self.assertEqual(
+                    first_ids,
+                    {id(client.connection_pool) for client in cache.clients.values()}
+                )
+
+            # This should throw a connection error and recreate the client class.
             cache.set('a', 'a')
+            self.assertMaxConnection(cache, 1)
+            second_ids = {id(client.connection_pool) for client in cache.clients.values()}
+            self.assertNotEqual(first_ids, second_ids)
 
-        self.assertMaxConnection(cache, 2)
-
-        for client in cache.clients.values():
-            client.connection_pool.release = releases[client.connection_pool]
-            client.connection_pool.max_connections = 2 ** 31
+        # Make sure raising a `ConnectionError` doesn't trigger an infinite loop.
+        with mock.patch('redis.client.Redis.execute_command') as mock_execute_command:
+            mock_execute_command.side_effect = redis.ConnectionError
+            with self.assertRaises(redis.ConnectionError):
+                cache.set('a', 'a')
 
     def test_has_key_with_no_key(self):
         self.assertFalse(self.cache.has_key('does_not_exist'))

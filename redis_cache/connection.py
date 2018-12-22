@@ -1,6 +1,23 @@
 from redis.connection import UnixDomainSocketConnection, Connection
 
 
+def get_connection_identifier_from_client(client):
+    """Return the connection identifier from a client.
+
+    The identifier is defined as the tuple:
+
+        (host, port, db, unix_socket_path)
+
+    """
+    kwargs = client.connection_pool.connection_kwargs
+    return (
+        kwargs.get('host', None),
+        kwargs.get('port', None),
+        kwargs['db'],
+        kwargs.get('path', None),
+    )
+
+
 class CacheConnectionPool(object):
 
     def __init__(self):
